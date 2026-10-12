@@ -1,5 +1,6 @@
 import hmac
 import os
+import threading
 
 from flask import Flask, jsonify, request
 
@@ -15,13 +16,55 @@ def _admin_autorizado():
     """Valida o header X-Admin-Key contra ADMIN_API_KEY (fail-closed).
 
     Sem a variável de ambiente configurada, nenhuma requisição é autorizada.
-    A comparação usa hmac.compare_digest para evitar timing attacks.
+    A comparação usa hmac.compare_digest sobre bytes para evitar timing
+    attacks e TypeError com caracteres não-ASCII no header (que crasharia
+    a rota com 500 antes da correção).
     """
     chave_esperada = _chave_admin_configurada()
     if not chave_esperada:
         return False
     chave_recebida = request.headers.get("X-Admin-Key", "")
-    return hmac.compare_digest(chave_recebida, chave_esperada)
+    try:
+        return hmac.compare_digest(
+            chave_recebida.encode("utf-8", errors="replace"),
+            chave_esperada.encode("utf-8"),
+        )
+    except TypeError:
+        return False
+
+
+def _json_body():
+    """Exige um objeto JSON no corpo; retorna (dados, None) ou (None, resposta 400)."""
+    dados = request.get_json(silent=True)
+    if not isinstance(dados, dict):
+        return None, (jsonify({"erro": "Corpo da requisição deve ser um objeto JSON"}), 400)
+    return dados, None
+
+
+def _campo_texto(dados, campo, max_len=200):
+    """Valida presença/tipo/tamanho de um campo de texto; retorna (valor, erro)."""
+    valor = dados.get(campo)
+    if not isinstance(valor, str) or not valor.strip():
+        return None, f"Campo '{campo}' é obrigatório e deve ser texto não vazio"
+    if len(valor) > max_len:
+        return None, f"Campo '{campo}' excede o limite de {max_len} caracteres"
+    return valor.strip(), None
+
+
+def _campo_email(dados, campo="email", max_len=320):
+    valor, erro = _campo_texto(dados, campo, max_len)
+    if erro:
+        return None, erro
+    if "@" not in valor or valor.startswith("@") or valor.endswith("@") or " " in valor:
+        return None, f"Campo '{campo}' deve ser um e-mail válido"
+    return valor, None
+
+
+def _campo_capacidade(dados, campo="capacidade_maxima"):
+    valor = dados.get(campo)
+    if isinstance(valor, bool) or not isinstance(valor, int) or valor <= 0:
+        return None, f"Campo '{campo}' deve ser um inteiro maior que zero"
+    return valor, None
 
 
 class Evento:
@@ -32,6 +75,7 @@ class Evento:
         self.capacidade_maxima = capacidade_maxima
         self.descricao = descricao
         self.inscricoes = []
+        self._lock = threading.Lock()
 
     def to_dict(self):
         return {
@@ -44,11 +88,14 @@ class Evento:
         }
 
     def inscrever(self, participante):
-        if len(self.inscricoes) >= self.capacidade_maxima:
-            return False, "Evento lotado"
+        # Check + append atômicos: sem a lock, requisições concorrentes
+        # poderiam ultrapassar a capacidade (check-then-act race).
+        with self._lock:
+            if len(self.inscricoes) >= self.capacidade_maxima:
+                return False, "Evento lotado"
 
-        self.inscricoes.append(participante)
-        return True, "Inscricao realizada com sucesso"
+            self.inscricoes.append(participante)
+            return True, "Inscricao realizada com sucesso"
 
     def verificar_lotacao(self):
         vagas_ocupadas = len(self.inscricoes)
@@ -83,8 +130,22 @@ id_participante_seq = 1
 @app.post("/eventos")
 def criar_evento():
     global id_evento_seq
-    dados = request.get_json()
-    evento = Evento(id_evento_seq, dados["nome"], dados["data"], dados["capacidade_maxima"], dados.get("descricao", ""))
+    dados, resposta = _json_body()
+    if resposta:
+        return resposta
+    nome, erro = _campo_texto(dados, "nome")
+    if erro:
+        return jsonify({"erro": erro}), 400
+    data, erro = _campo_texto(dados, "data")
+    if erro:
+        return jsonify({"erro": erro}), 400
+    capacidade_maxima, erro = _campo_capacidade(dados)
+    if erro:
+        return jsonify({"erro": erro}), 400
+    descricao = dados.get("descricao", "")
+    if not isinstance(descricao, str):
+        return jsonify({"erro": "Campo 'descricao' deve ser texto"}), 400
+    evento = Evento(id_evento_seq, nome, data, capacidade_maxima, descricao)
     db_eventos.append(evento)
     id_evento_seq += 1
     return jsonify(evento.to_dict()), 201
@@ -109,8 +170,16 @@ def inscrever_participante(id):
     evento = next((e for e in db_eventos if e.id == id), None)
     if not evento:
         return jsonify({"erro": "Evento nao encontrado"}), 404
-    dados = request.get_json()
-    participante = Participante(id_participante_seq, dados["nome"], dados["email"])
+    dados, resposta = _json_body()
+    if resposta:
+        return resposta
+    nome, erro = _campo_texto(dados, "nome")
+    if erro:
+        return jsonify({"erro": erro}), 400
+    email, erro = _campo_email(dados)
+    if erro:
+        return jsonify({"erro": erro}), 400
+    participante = Participante(id_participante_seq, nome, email)
     sucesso, mensagem = evento.inscrever(participante)
     if not sucesso:
         return jsonify({"erro": mensagem}), 400
@@ -137,4 +206,7 @@ def verificar_lotacao(id):
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    # O debugger interativo do Werkzeug nunca deve ser habilitado por padrão:
+    # qualquer exceção não tratada expõe código-fonte e, com o PIN violado,
+    # permite execução remota de código. Só ativa com FLASK_DEBUG=1 explícito.
+    app.run(debug=os.environ.get("FLASK_DEBUG") == "1")
