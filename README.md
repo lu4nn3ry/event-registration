@@ -23,6 +23,10 @@ pip install flask
 python app.py
 ```
 
+> **Segurança:** o modo debug do Flask (debugger interativo do Werkzeug)
+> fica **desativado** por padrão. Só é habilitado com a variável de ambiente
+> `FLASK_DEBUG=1`, exclusivamente para desenvolvimento local.
+
 > **Segurança:** para consultar `GET /eventos/{id}/inscricoes`, defina a
 > variável de ambiente `ADMIN_API_KEY` e envie o header `X-Admin-Key` com
 > o mesmo valor. Sem a variável configurada, o endpoint nega o acesso
