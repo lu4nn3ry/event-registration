@@ -27,10 +27,14 @@ python app.py
 > fica **desativado** por padrão. Só é habilitado com a variável de ambiente
 > `FLASK_DEBUG=1`, exclusivamente para desenvolvimento local.
 
-> **Segurança:** para consultar `GET /eventos/{id}/inscricoes`, defina a
-> variável de ambiente `ADMIN_API_KEY` e envie o header `X-Admin-Key` com
-> o mesmo valor. Sem a variável configurada, o endpoint nega o acesso
-> (fail-closed).
+> **Segurança:** para consultar `GET /eventos/{id}/inscricoes` e criar
+> eventos (`POST /eventos`), defina a variável de ambiente
+> `EVENTREG_API_KEY` e envie o header `X-Admin-Key` com o mesmo valor.
+> A variável `ADMIN_API_KEY` (histórica) continua aceita como fallback.
+> Sem variável configurada, esses endpoints negam o acesso (fail-closed).
+
+> **Segurança:** os IDs de eventos e participantes são UUIDv4 aleatórios
+> (não sequenciais), impedindo enumeração de registros pela API.
 
 ## Endpoints
 
@@ -57,13 +61,14 @@ python app.py
 ```bash
 curl -X POST http://localhost:5000/eventos \
   -H "Content-Type: application/json" \
+  -H "X-Admin-Key: $EVENTREG_API_KEY" \
   -d '{"nome": "Workshop Python", "data": "2026-06-20", "capacidade_maxima": 3, "descricao": "Workshop de Python"}'
 ```
 
 ### Inscrever participante
 
 ```bash
-curl -X POST http://localhost:5000/eventos/1/inscricoes \
+curl -X POST http://localhost:5000/eventos/<id-do-evento>/inscricoes \
   -H "Content-Type: application/json" \
   -d '{"nome": "Luann", "email": "luann@email.com"}'
 ```
@@ -71,5 +76,5 @@ curl -X POST http://localhost:5000/eventos/1/inscricoes \
 ### Verificar lotação
 
 ```bash
-curl http://localhost:5000/eventos/1/lotacao
+curl http://localhost:5000/eventos/<id-do-evento>/lotacao
 ```

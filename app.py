@@ -1,6 +1,8 @@
 import hmac
 import os
 import threading
+import uuid
+from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request
 
@@ -9,7 +11,9 @@ app = Flask(__name__)
 
 
 def _chave_admin_configurada():
-    return os.environ.get("ADMIN_API_KEY", "")
+    # EVENTREG_API_KEY (nome canônico) tem precedência; ADMIN_API_KEY
+    # (nome histórico dos ADRs 0001/0002) continua aceito.
+    return os.environ.get("EVENTREG_API_KEY") or os.environ.get("ADMIN_API_KEY", "")
 
 
 def _admin_autorizado():
@@ -31,6 +35,24 @@ def _admin_autorizado():
         )
     except TypeError:
         return False
+
+
+def _origem_confiavel():
+    """Valida a origem de requisições de navegador na rota pública de inscrição.
+
+    A inscrição é pública por design (ADR 0001), mas requisições de
+    navegador cujo Origin aponte para outro host são rejeitadas, impedindo
+    envios forjados a partir de páginas de terceiros. Clientes sem header
+    Origin (curl, aplicativos) continuam permitidos.
+    """
+    origem = request.headers.get("Origin")
+    if not origem:
+        return True
+    host_origem = urlparse(origem).hostname
+    if not host_origem:
+        return False
+    host_requisicao = request.host.rsplit(":", 1)[0].lower()
+    return host_origem.lower() == host_requisicao
 
 
 def _json_body():
@@ -123,13 +145,18 @@ class Participante:
 
 
 db_eventos = []
-id_evento_seq = 1
-id_participante_seq = 1
+
+
+def _novo_id():
+    # IDs aleatórios (UUIDv4) impedem enumeração e não vazam o volume
+    # de registros, ao contrário de contadores sequenciais.
+    return uuid.uuid4()
 
 
 @app.post("/eventos")
 def criar_evento():
-    global id_evento_seq
+    if not _admin_autorizado():
+        return jsonify({"erro": "Acesso restrito a administradores"}), 403
     dados, resposta = _json_body()
     if resposta:
         return resposta
@@ -145,9 +172,8 @@ def criar_evento():
     descricao = dados.get("descricao", "")
     if not isinstance(descricao, str):
         return jsonify({"erro": "Campo 'descricao' deve ser texto"}), 400
-    evento = Evento(id_evento_seq, nome, data, capacidade_maxima, descricao)
+    evento = Evento(_novo_id(), nome, data, capacidade_maxima, descricao)
     db_eventos.append(evento)
-    id_evento_seq += 1
     return jsonify(evento.to_dict()), 201
 
 
@@ -156,7 +182,7 @@ def listar_eventos():
     return jsonify([e.to_dict() for e in db_eventos])
 
 
-@app.get("/eventos/<int:id>")
+@app.get("/eventos/<uuid:id>")
 def obter_evento(id):
     evento = next((e for e in db_eventos if e.id == id), None)
     if not evento:
@@ -164,9 +190,10 @@ def obter_evento(id):
     return jsonify(evento.to_dict())
 
 
-@app.post("/eventos/<int:id>/inscricoes")
+@app.post("/eventos/<uuid:id>/inscricoes")
 def inscrever_participante(id):
-    global id_participante_seq
+    if not _origem_confiavel():
+        return jsonify({"erro": "Origem nao permitida"}), 403
     evento = next((e for e in db_eventos if e.id == id), None)
     if not evento:
         return jsonify({"erro": "Evento nao encontrado"}), 404
@@ -179,15 +206,14 @@ def inscrever_participante(id):
     email, erro = _campo_email(dados)
     if erro:
         return jsonify({"erro": erro}), 400
-    participante = Participante(id_participante_seq, nome, email)
+    participante = Participante(_novo_id(), nome, email)
     sucesso, mensagem = evento.inscrever(participante)
     if not sucesso:
         return jsonify({"erro": mensagem}), 400
-    id_participante_seq += 1
     return jsonify({"mensagem": mensagem, "participante": participante.to_dict()}), 201
 
 
-@app.get("/eventos/<int:id>/inscricoes")
+@app.get("/eventos/<uuid:id>/inscricoes")
 def listar_inscricoes(id):
     if not _admin_autorizado():
         return jsonify({"erro": "Acesso restrito a administradores"}), 403
@@ -197,7 +223,7 @@ def listar_inscricoes(id):
     return jsonify([p.to_dict() for p in evento.inscricoes])
 
 
-@app.get("/eventos/<int:id>/lotacao")
+@app.get("/eventos/<uuid:id>/lotacao")
 def verificar_lotacao(id):
     evento = next((e for e in db_eventos if e.id == id), None)
     if not evento:

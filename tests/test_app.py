@@ -1,5 +1,7 @@
 """Testes de segurança e funcionais da API de eventos."""
 
+import uuid
+
 import pytest
 
 from app import app
@@ -13,10 +15,17 @@ def client():
 
 
 @pytest.fixture
-def evento_com_inscricao(client):
+def chave_admin(monkeypatch):
+    monkeypatch.setenv("EVENTREG_API_KEY", "secreta")
+    return {"X-Admin-Key": "secreta"}
+
+
+@pytest.fixture
+def evento_com_inscricao(client, chave_admin):
     resp = client.post(
         "/eventos",
         json={"nome": "Workshop", "data": "2026-06-20", "capacidade_maxima": 5},
+        headers=chave_admin,
     )
     assert resp.status_code == 201
     evento_id = resp.get_json()["id"]
@@ -81,33 +90,45 @@ class TestEndpointsPublicos:
 class TestValidacaoEntrada:
     """Entradas malformadas retornam 400, nunca 500 (sem debugger)."""
 
-    def test_criar_evento_sem_nome(self, client):
-        resp = client.post("/eventos", json={"data": "2026-06-20", "capacidade_maxima": 5})
+    def test_criar_evento_sem_nome(self, client, chave_admin):
+        resp = client.post(
+            "/eventos",
+            json={"data": "2026-06-20", "capacidade_maxima": 5},
+            headers=chave_admin,
+        )
         assert resp.status_code == 400
 
-    def test_criar_evento_capacidade_string(self, client):
+    def test_criar_evento_capacidade_string(self, client, chave_admin):
         resp = client.post(
             "/eventos",
             json={"nome": "W", "data": "2026-06-20", "capacidade_maxima": "tres"},
+            headers=chave_admin,
         )
         assert resp.status_code == 400
 
-    def test_criar_evento_capacidade_negativa(self, client):
+    def test_criar_evento_capacidade_negativa(self, client, chave_admin):
         resp = client.post(
             "/eventos",
             json={"nome": "W", "data": "2026-06-20", "capacidade_maxima": -1},
+            headers=chave_admin,
         )
         assert resp.status_code == 400
 
-    def test_criar_evento_capacidade_booleana(self, client):
+    def test_criar_evento_capacidade_booleana(self, client, chave_admin):
         resp = client.post(
             "/eventos",
             json={"nome": "W", "data": "2026-06-20", "capacidade_maxima": True},
+            headers=chave_admin,
         )
         assert resp.status_code == 400
 
-    def test_criar_evento_sem_json(self, client):
-        resp = client.post("/eventos", data="não é json", content_type="text/plain")
+    def test_criar_evento_sem_json(self, client, chave_admin):
+        resp = client.post(
+            "/eventos",
+            data="não é json",
+            content_type="text/plain",
+            headers=chave_admin,
+        )
         assert resp.status_code == 400
 
     def test_inscricao_sem_email(self, client, evento_com_inscricao):
@@ -133,6 +154,104 @@ class TestValidacaoEntrada:
             headers={"X-Admin-Key": "café"},
         )
         assert resp.status_code == 403
+
+
+class TestAuthCriacaoEventos:
+    """POST /eventos exige X-Admin-Key (fail-closed)."""
+
+    payload = {"nome": "W", "data": "2026-06-20", "capacidade_maxima": 5}
+
+    def test_sem_chave_configurada_negado(self, client, monkeypatch):
+        monkeypatch.delenv("EVENTREG_API_KEY", raising=False)
+        monkeypatch.delenv("ADMIN_API_KEY", raising=False)
+        resp = client.post("/eventos", json=self.payload)
+        assert resp.status_code == 403
+
+    def test_sem_header_negado(self, client, monkeypatch):
+        monkeypatch.setenv("EVENTREG_API_KEY", "secreta")
+        resp = client.post("/eventos", json=self.payload)
+        assert resp.status_code == 403
+
+    def test_chave_errada_negada(self, client, monkeypatch):
+        monkeypatch.setenv("EVENTREG_API_KEY", "secreta")
+        resp = client.post(
+            "/eventos", json=self.payload, headers={"X-Admin-Key": "errada"}
+        )
+        assert resp.status_code == 403
+
+    def test_chave_correta_cria(self, client, chave_admin):
+        resp = client.post("/eventos", json=self.payload, headers=chave_admin)
+        assert resp.status_code == 201
+
+    def test_admin_api_key_legado_aceita(self, client, monkeypatch):
+        """ADMIN_API_KEY (ADRs 0001/0002) continua válido como fallback."""
+        monkeypatch.delenv("EVENTREG_API_KEY", raising=False)
+        monkeypatch.setenv("ADMIN_API_KEY", "legada")
+        resp = client.post(
+            "/eventos", json=self.payload, headers={"X-Admin-Key": "legada"}
+        )
+        assert resp.status_code == 201
+
+
+class TestOrigemInscricao:
+    """Inscrição pública rejeita Origin de outro host (cross-site)."""
+
+    def test_origem_externa_negada(self, client, evento_com_inscricao):
+        resp = client.post(
+            f"/eventos/{evento_com_inscricao}/inscricoes",
+            json={"nome": "Ataque", "email": "ataque@mal.example"},
+            headers={"Origin": "https://malicioso.example"},
+        )
+        assert resp.status_code == 403
+
+    def test_origem_mesma_permitida(self, client, evento_com_inscricao):
+        resp = client.post(
+            f"/eventos/{evento_com_inscricao}/inscricoes",
+            json={"nome": "Ok", "email": "ok@email.com"},
+            headers={"Origin": "http://localhost"},
+        )
+        assert resp.status_code == 201
+
+    def test_sem_origem_permitida(self, client, evento_com_inscricao):
+        """Clientes sem Origin (curl, aplicativos) continuam permitidos."""
+        resp = client.post(
+            f"/eventos/{evento_com_inscricao}/inscricoes",
+            json={"nome": "Curl", "email": "curl@email.com"},
+        )
+        assert resp.status_code == 201
+
+
+class TestIdsAleatorios:
+    """IDs públicos são UUIDv4, não sequenciais (anti-enumeração)."""
+
+    def test_id_evento_e_uuid(self, client, chave_admin):
+        resp = client.post(
+            "/eventos",
+            json={"nome": "W", "data": "2026-06-20", "capacidade_maxima": 5},
+            headers=chave_admin,
+        )
+        assert resp.status_code == 201
+        uuid.UUID(resp.get_json()["id"])  # inválido lançaria ValueError
+
+    def test_id_participante_e_uuid(self, client, evento_com_inscricao):
+        resp = client.post(
+            f"/eventos/{evento_com_inscricao}/inscricoes",
+            json={"nome": "Luann", "email": "luann2@email.com"},
+        )
+        assert resp.status_code == 201
+        uuid.UUID(resp.get_json()["participante"]["id"])
+
+    def test_ids_nao_sao_sequenciais(self, client, chave_admin):
+        ids = []
+        for _ in range(2):
+            resp = client.post(
+                "/eventos",
+                json={"nome": "W", "data": "2026-06-20", "capacidade_maxima": 5},
+                headers=chave_admin,
+            )
+            ids.append(resp.get_json()["id"])
+        assert ids[0] != ids[1]
+        assert not (ids[0].isdigit() and ids[1].isdigit())
 
 
 class TestLotacaoConcorrente:
